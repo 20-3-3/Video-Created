@@ -1,6 +1,6 @@
 """Narrator track for stanciya_ep1 from a recorded take instead of TTS.
 
-usage: narrator_take.py WORK TAKE.wav TAKE_WORDS.json [MEMO_DIR]
+usage: [TAKE=name] narrator_take.py WORK TAKE.wav TAKE_WORDS.json [MEMO_DIR]
 
 WORK is the directory voiceover.py wrote (timeline.json with section speeds and freeze frames).
 TAKE.wav is the denoised recording of the narrator lines, TAKE_WORDS.json its word timings
@@ -10,11 +10,13 @@ time-stretched (atempo) so it ends before the next chunk's caption. The passenge
 not in the take: MEMO_DIR holds takes of each rule read in the same voice (clone_memo.py); the
 take closest to the recorded voice that still leaves a pause before the next rule is placed on
 it, EQ'd and levelled to match the take. Writes WORK/track_narrator.f32 (replacing the TTS narrator),
-WORK/alignment_take.json, and WORK/narrator_fx.txt, the chain mix.py then uses for this voice.
+WORK/alignment_take.json, and WORK/narrator_fx.txt, the chain mix.py then uses for this voice
+(TAKE_FX[TAKE]; each recording gets its own).
 """
 import json
 import os
 import sys
+from difflib import SequenceMatcher
 
 import numpy as np
 
@@ -25,21 +27,39 @@ SQUEEZE_MIN = 0.8  # shortest a chunk may be squeezed to fit before the next cap
 EDGE = 0.25  # search window (s) for the cut before the first and after the last word of a line
 PAD = 0.03  # silence kept around a trimmed chunk so soft onsets and releases survive
 CUT_MAX_DB = -30  # a cut between chunks must be this far below the speech level, else they stay joined
-# recorded narrator (phone, close mic): no rumble, less boom and mud, more presence, broadcast leveling
-TAKE_FX = ("highpass=f=70,equalizer=f=280:t=q:w=1:g=-3,equalizer=f=550:t=q:w=1.4:g=-1.5,"
-           "equalizer=f=3500:t=q:w=1.2:g=3,treble=g=1:f=8000:w=0.6,deesser=i=0.3,"
-           "acompressor=threshold=-24dB:ratio=3:attack=10:release=180:makeup=2.5")
+MAX_DRIFT = 0.35  # ...unless joining them puts a word this far (s) off its caption
+HARD_FADE_MS = 20  # fade at a cut that had to be made inside running speech
+LEVELER = "acompressor=threshold=-24dB:ratio=3:attack=10:release=180:makeup=2.5"
+TAKE_FX = {
+    # phone, close mic (take_transcript.txt): no rumble, less boom and mud, more presence
+    "1": "highpass=f=70,equalizer=f=280:t=q:w=1:g=-3,equalizer=f=550:t=q:w=1.4:g=-1.5,"
+         f"equalizer=f=3500:t=q:w=1.2:g=3,treble=g=1:f=8000:w=0.6,deesser=i=0.3,{LEVELER}",
+    # deeper voice from a voice message with a dull top (take2_transcript.txt): a little warmth,
+    # less box, presence and air back
+    "2": "highpass=f=60,bass=g=2:f=110:w=0.7,equalizer=f=450:t=q:w=1.2:g=-2,"
+         f"equalizer=f=4500:t=o:w=1.2:g=5,treble=g=4:f=7000:w=0.6,deesser=i=0.4,{LEVELER}",
+}
 
 
 def chunk_words(text):
     return [w for w in text.split() if vo.letters(w)]
 
 
+def drift(group):
+    """Largest distance (s) between a word and its caption once the group is stretched to follow them."""
+    t = np.array([w["start"] - group["words"][0]["start"] for w, o in zip(group["words"], group["onsets"]) if o is not None])
+    c = np.array([o - group["onsets"][0] for o in group["onsets"] if o is not None])
+    sc = np.clip((t * c).sum() / max((t ** 2).sum(), 1e-6), vo.STRETCH_MIN, vo.STRETCH_MAX)
+    return float(np.abs(sc * t - c).max())
+
+
 def cut_take(take, words, chunks, speech_db):
     """Split one line of the take into its caption chunks (text, per-word caption onsets).
 
     Where the reading runs on without a pause (the quietest point between the chunks is still
-    within CUT_MAX_DB of the speech level), the chunks stay together as one part.
+    within CUT_MAX_DB of the speech level), the chunks stay together as one part, as long as their
+    words can still follow the captions within MAX_DRIFT; otherwise the cut is made anyway and
+    softened with longer fades.
     """
     groups, k = [], 0
     for text, onsets in chunks:
@@ -48,15 +68,19 @@ def cut_take(take, words, chunks, speech_db):
         k += n
     db, win = vo.rms_db(take, 0, len(take))
     merged, bounds = [groups[0]], [vo.cut_point(take, max(0.0, words[0]["start"] - EDGE), words[0]["start"])]
+    hard = [False]
     for g in groups[1:]:
         cut = vo.cut_point(take, merged[-1]["words"][-1]["end"], g["words"][0]["start"])
-        if db[min(cut // win, len(db) - 1)] > speech_db + CUT_MAX_DB:
-            m = merged[-1]
-            merged[-1] = dict(words=m["words"] + g["words"], text=f"{m['text']} {g['text']}",
-                              onsets=m["onsets"] + g["onsets"])
+        m = merged[-1]
+        joined = dict(words=m["words"] + g["words"], text=f"{m['text']} {g['text']}", onsets=m["onsets"] + g["onsets"])
+        in_speech = db[min(cut // win, len(db) - 1)] > speech_db + CUT_MAX_DB
+        if in_speech and drift(joined) <= MAX_DRIFT:
+            merged[-1] = joined
         else:
             merged.append(g)
             bounds.append(cut)
+            hard[-1] = hard[-1] or in_speech
+            hard.append(in_speech)
     end = words[-1]["end"]
     bounds.append(vo.cut_point(take, end, min(len(take) / SR, end + EDGE)))
     out = []
@@ -64,7 +88,7 @@ def cut_take(take, words, chunks, speech_db):
         seg, lead = vo.trim(take[bounds[k]:bounds[k + 1]], pad=PAD)
         t0 = (bounds[k] + lead) / SR
         out.append(dict(audio=seg, rel=[max(0.0, w["start"] - t0) for w in g["words"]], text=g["text"],
-                        onsets=g["onsets"], words=[w["text"] for w in g["words"]]))
+                        onsets=g["onsets"], words=[w["text"] for w in g["words"]], hard=hard[k]))
     return out
 
 
@@ -121,7 +145,7 @@ def place(track, report, li, role, parts, w1):
         sc = float(np.clip(vo.fit_scale(p) or 1.0, vo.STRETCH_MIN, vo.STRETCH_MAX))
         if start + dur * sc > limit:
             sc = max((limit - start) / dur, SQUEEZE_MIN)
-        seg = vo.fade(vo.stretch(p["audio"], sc))
+        seg = vo.fade(vo.stretch(p["audio"], sc), ms=HARD_FADE_MS if p.get("hard") else 8)
         i = int(start * SR)
         track[i:i + len(seg)] += seg[:len(track) - i]
         end = start + len(seg) / SR
@@ -162,13 +186,17 @@ def main():
             n = sum(len(chunk_words(t)) for t, _ in chunks)
             parts = cut_take(take, words[wi:wi + n], chunks, speech_db)
             wi += n
-            # the take may differ in a word ending (дежурный / дежурная), not in the words themselves
+            # the reader may change a word here and there (дежурный / дежурная, под / над), no more
             for p in parts:
-                assert [vo.letters(w)[:4] for w in p["words"]] == [vo.letters(w)[:4] for w in chunk_words(p["text"])], p
+                said, script = [vo.letters(w) for w in p["words"]], [vo.letters(w) for w in chunk_words(p["text"])]
+                assert SequenceMatcher(None, "".join(said), "".join(script)).ratio() > 0.8, (said, script)
+                for a, b in zip(said, script):
+                    if a != b:
+                        print(f"  take reads «{a}» for «{b}»")
         place(track, report, li, role, parts, vo.remap(w1))
     assert wi == len(words), f"{len(words) - wi} words of the take were not used"
     track.tofile(f"{work}/track_narrator.f32")
-    open(f"{work}/narrator_fx.txt", "w").write(TAKE_FX + "\n")
+    open(f"{work}/narrator_fx.txt", "w").write(TAKE_FX[os.environ.get("TAKE", "1")] + "\n")
     json.dump(report, open(f"{work}/alignment_take.json", "w"), ensure_ascii=False, indent=1)
 
 
