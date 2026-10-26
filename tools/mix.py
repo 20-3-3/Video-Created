@@ -1,6 +1,6 @@
 """Process the per-role voice tracks, retime the source picture and ambience (section speeds and
 freeze frames written by voiceover.py), duck the ambience under the voices and encode the result."""
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 
 import numpy as np
 
@@ -21,6 +21,9 @@ FX = {
                  "acompressor=threshold=-22dB:ratio=2.5:attack=5:release=150:makeup=1.5,"
                  "aecho=0.9:0.35:55|120|210:0.16|0.09|0.05",
 }
+# a narrator track that is not TTS (narrator_take.py) comes with its own chain
+if os.path.exists(f"{WORK}/narrator_fx.txt"):
+    FX["narrator"] = open(f"{WORK}/narrator_fx.txt").read().strip()
 TARGET = {"narrator": -16.0, "pa": -17.5, "attendant": -16.5}  # LUFS of speech (gated)
 ROOM_TONE = (45.3, 47.3)  # steady platform drone without effects, looped under freeze frames
 XFADE = 0.04

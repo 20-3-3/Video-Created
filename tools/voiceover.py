@@ -26,9 +26,7 @@ import requests
 edge_comm._SSL_CTX = ssl.create_default_context(cafile="/root/.ccr/ca-bundle.crt")
 
 SR = 48000
-WORK = sys.argv[1]
-os.makedirs(f"{WORK}/cache", exist_ok=True)
-os.makedirs(f"{WORK}/chunks", exist_ok=True)
+WORK = None  # output directory, set in __main__
 
 ENGINE = os.environ.get("TTS_ENGINE", "edge")
 ROLES = {
@@ -446,4 +444,7 @@ def build():
 
 
 if __name__ == "__main__":
+    WORK = sys.argv[1]
+    os.makedirs(f"{WORK}/cache", exist_ok=True)
+    os.makedirs(f"{WORK}/chunks", exist_ok=True)
     build()
