@@ -25,7 +25,8 @@ os.makedirs(f"{WORK}/cache", exist_ok=True)
 os.makedirs(f"{WORK}/chunks", exist_ok=True)
 
 ROLES = {
-    "narrator": dict(voice="en-US-BrianMultilingualNeural", pitch="-4Hz", base_rate=-14, rates=(-18, -10)),
+    "narrator": dict(voice=os.environ.get("NARRATOR_VOICE", "en-US-AndrewMultilingualNeural"),
+                     pitch=os.environ.get("NARRATOR_PITCH", "-8Hz"), base_rate=-14, rates=(-18, -10)),
     "pa": dict(voice="ru-RU-SvetlanaNeural", pitch="+0Hz", base_rate=-10, rates=(-15, -5)),
     "attendant": dict(voice="en-US-EmmaMultilingualNeural", pitch="-10Hz", base_rate=-16, rates=(-20, -12)),
 }

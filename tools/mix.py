@@ -1,13 +1,29 @@
 """Process the per-role voice tracks, duck the original soundtrack under them and mux with the video."""
-import json, re, subprocess, sys
+import json, os, re, subprocess, sys
 
 WORK, VIDEO, OUT, STEM = sys.argv[1:5]
 SR = 48000
+NARRATOR_SHIFT = float(os.environ.get("NARRATOR_SHIFT", "0.82"))  # pitch ratio, formants move with it
+
+
+def narrator_graph(pitch, sub_db=-16.0, flanger_width=22):
+    """Deep, velvety, slightly synthetic announcer."""
+    return (
+        f"[0:a]rubberband=pitch={pitch}:formant=shifted:pitchq=quality,"
+        "highpass=f=40,bass=g=3.5:f=110:w=0.7,equalizer=f=420:t=q:w=1.2:g=-2.5,"
+        "equalizer=f=3000:t=q:w=1.4:g=-2,treble=g=-3.5:f=7500:w=0.6,deesser=i=0.35,"
+        "acompressor=threshold=-24dB:ratio=3:attack=10:release=200:makeup=3,asplit=2[dry][s];"
+        # sub-octave double: adds weight and a faint synthetic edge
+        f"[s]rubberband=pitch=0.5:formant=shifted:pitchq=quality,lowpass=f=900,volume={sub_db}dB[sub];"
+        "[dry][sub]amix=inputs=2:normalize=0,"
+        # slow, shallow flanger sweep: the 'electronic' sheen
+        f"flanger=delay=1.5:depth=1.2:regen=15:width={flanger_width}:speed=0.25:shape=sinusoidal,"
+        "alimiter=limit=0.9:level=false"
+    )
+
 
 FX = {
-    # close, dry storyteller: trim rumble, a little warmth, gentle leveling
-    "narrator": "highpass=f=70,equalizer=f=140:t=q:w=1.2:g=2.5,equalizer=f=3500:t=q:w=1.5:g=1.5,"
-                "acompressor=threshold=-22dB:ratio=3:attack=5:release=150:makeup=2",
+    "narrator": narrator_graph(NARRATOR_SHIFT),
     # platform loudspeaker: narrow band, slight overdrive, hall reflections
     "pa": "highpass=f=320,lowpass=f=3600,equalizer=f=1700:t=q:w=1:g=5,volume=8dB,asoftclip=type=tanh,"
           "volume=-6dB,aecho=0.85:0.6:75|170|290|450:0.35|0.22|0.14|0.08",
@@ -31,7 +47,7 @@ def integrated(path, fmt_args):
 raw = ["-f", "f32le", "-ar", str(SR), "-ac", "1"]
 for role, fx in FX.items():
     src, dst = f"{WORK}/track_{role}.f32", f"{WORK}/fx_{role}.wav"
-    run(["ffmpeg", "-y", "-v", "error", *raw, "-i", src, "-af", fx, "-c:a", "pcm_f32le", dst])
+    run(["ffmpeg", "-y", "-v", "error", *raw, "-i", src, "-filter_complex", fx, "-c:a", "pcm_f32le", dst])
     lufs = integrated(dst, [])
     gain = TARGET[role] - lufs
     run(["ffmpeg", "-y", "-v", "error", "-i", dst, "-af", f"volume={gain:.2f}dB", "-c:a", "pcm_f32le", f"{WORK}/lv_{role}.wav"])
