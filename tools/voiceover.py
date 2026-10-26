@@ -1,10 +1,15 @@
 """Build a voice-over track for stanciya_ep1 aligned to the burned-in kinetic captions.
 
-Each line is synthesized whole (edge-tts, with word boundaries) so intonation stays natural,
-then cut into chunks at caption-group boundaries. Every chunk starts when its first word
-appears on screen and is gently time-stretched (atempo) so its words track the captions.
+Each line is synthesized whole so intonation stays natural, then cut into chunks at caption-group
+boundaries. Every chunk starts when its first word appears on screen and is gently time-stretched
+(atempo) so its words track the captions.
+
+TTS_ENGINE picks the synthesizer: "edge" (edge-tts, reports word boundaries itself) or "google"
+(Google Cloud Text-to-Speech, key in GOOGLE_TTS_API_KEY; Chirp 3 HD voices report no word timings,
+so the words are located in the audio with faster-whisper).
 """
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -16,6 +21,7 @@ import sys
 import edge_tts
 import edge_tts.communicate as edge_comm
 import numpy as np
+import requests
 
 edge_comm._SSL_CTX = ssl.create_default_context(cafile="/root/.ccr/ca-bundle.crt")
 
@@ -24,12 +30,20 @@ WORK = sys.argv[1]
 os.makedirs(f"{WORK}/cache", exist_ok=True)
 os.makedirs(f"{WORK}/chunks", exist_ok=True)
 
+ENGINE = os.environ.get("TTS_ENGINE", "edge")
 ROLES = {
     "narrator": dict(voice=os.environ.get("NARRATOR_VOICE", "en-US-AndrewMultilingualNeural"),
                      pitch=os.environ.get("NARRATOR_PITCH", "-6Hz"), base_rate=-14, rates=(-18, -10)),
     "pa": dict(voice="ru-RU-SvetlanaNeural", pitch="+0Hz", base_rate=-10, rates=(-15, -5)),
     "attendant": dict(voice="en-US-EmmaMultilingualNeural", pitch="-10Hz", base_rate=-16, rates=(-20, -12)),
 }
+if ENGINE == "google":
+    # Chirp 3 HD takes no pitch; voice colour is left to the role chains in mix.py
+    GOOGLE_VOICES = dict(narrator=os.environ.get("NARRATOR_VOICE", "ru-RU-Chirp3-HD-Charon"),
+                         pa=os.environ.get("PA_VOICE", "ru-RU-Chirp3-HD-Kore"),
+                         attendant=os.environ.get("ATTENDANT_VOICE", "ru-RU-Chirp3-HD-Gacrux"))
+    for role, voice in GOOGLE_VOICES.items():
+        ROLES[role].update(voice=voice, pitch="")
 
 # Playback speed per section of the source video (start, end in seconds, speed); the platform
 # announcement scene (frames 314-542) keeps its original pace. Times in LINES are source times.
@@ -123,6 +137,8 @@ LINES = [
 STRETCH_MIN, STRETCH_MAX = 0.92, 1.08  # duration scale limits applied by atempo
 WORD_LAG = 0.06  # decoded audio starts this much after edge-tts word offsets
 MIN_GAP = 0.06
+# aligned word times can overlap the pause between chunks, so the quietest point is searched a bit wider
+CUT_SLACK = 0.12 if ENGINE == "google" else 0.0
 
 
 def letters(s):
@@ -154,22 +170,108 @@ async def _synth(text, voice, rate, pitch, mp3_path):
     return words
 
 
+def _google_synth(text, voice, rate, wav_path):
+    r = requests.post("https://texttospeech.googleapis.com/v1/text:synthesize",
+                      headers={"X-Goog-Api-Key": os.environ["GOOGLE_TTS_API_KEY"]}, timeout=120,
+                      json=dict(input=dict(text=text), voice=dict(languageCode=voice[:5], name=voice),
+                                audioConfig=dict(audioEncoding="LINEAR16", sampleRateHertz=SR,
+                                                 speakingRate=round(1 + rate / 100, 3))))
+    if r.status_code != 200:
+        raise RuntimeError(f"Google TTS {r.status_code}: {r.text[:500]}")
+    with open(wav_path, "wb") as f:
+        f.write(base64.b64decode(r.json()["audioContent"]))
+    return align_words(wav_path, text)
+
+
+_whisper = None
+
+
+def align_words(path, text):
+    """Word timings for a take of `text`: Whisper word timestamps matched to the script letter by letter.
+
+    Letters Whisper heard differently (or wrote as digits) get no time of their own; script words left
+    without any matched letter are interpolated between their neighbours.
+    """
+    global _whisper
+    from difflib import SequenceMatcher
+    from faster_whisper import WhisperModel
+    if _whisper is None:
+        _whisper = WhisperModel(os.environ.get("WHISPER_MODEL", "medium"), device="cpu", compute_type="int8")
+    segs, _ = _whisper.transcribe(ffmpeg_decode(path, 16000), language="ru", word_timestamps=True,
+                                  initial_prompt=text, beam_size=5, condition_on_previous_text=False)
+    heard = [w for s in segs for w in s.words]
+    # time at which each heard letter starts and ends, spread evenly over its word
+    h_chars, h_t0, h_t1 = [], [], []
+    for w in heard:
+        ls = letters(w.word)
+        step = (w.end - w.start) / max(1, len(ls))
+        for k, ch in enumerate(ls):
+            h_chars.append(ch)
+            h_t0.append(w.start + k * step)
+            h_t1.append(w.start + (k + 1) * step)
+    script = [t for t in text.split() if letters(t)]
+    s_chars, owner = [], []
+    for i, t in enumerate(script):
+        for ch in letters(t):
+            s_chars.append(ch)
+            owner.append(i)
+    start, end = [None] * len(script), [None] * len(script)
+    for a, b, n in SequenceMatcher(None, s_chars, h_chars, autojunk=False).get_matching_blocks():
+        for k in range(n):
+            i = owner[a + k]
+            if start[i] is None:
+                start[i] = h_t0[b + k]
+            end[i] = h_t1[b + k]
+    known = [i for i in range(len(script)) if start[i] is not None]
+    if not known:
+        raise RuntimeError(f"alignment failed: {text!r} heard as {''.join(w.word for w in heard)!r}")
+    for i in range(len(script)):
+        if start[i] is None:  # spread the gap between the matched neighbours by letter count
+            lo = max((j for j in known if j < i), default=None)
+            hi = min((j for j in known if j > i), default=None)
+            t0 = end[lo] if lo is not None else 0.0
+            t1 = start[hi] if hi is not None else t0 + 0.08 * sum(len(letters(t)) for t in script[i:])
+            span = range((lo + 1) if lo is not None else 0, hi if hi is not None else len(script))
+            n = [len(letters(script[j])) for j in span]
+            k = list(span).index(i)
+            start[i] = t0 + (t1 - t0) * sum(n[:k]) / sum(n)
+            end[i] = t0 + (t1 - t0) * sum(n[:k + 1]) / sum(n)
+    # Whisper hands a pause (often with a breath in it) to the word after it: move each word's edges
+    # inwards to where the level comes within 20 dB of that word's own peak (30 ms smoothing)
+    db, win = rms_db(ffmpeg_decode(path), 0, None)
+    db = 10 * np.log10(np.convolve(10 ** (db / 10), np.ones(3) / 3, mode="same") + 1e-12)
+    for i in range(len(script)):
+        a, b = int(start[i] * SR / win), min(len(db), int(end[i] * SR / win))
+        if b - a < 4:
+            continue
+        thr = max(db.max() - 30, db[a:b].max() - 20)
+        while a < b - 3 and db[a] < thr:
+            a += 1
+        while b > a + 3 and db[b - 1] < thr:
+            b -= 1
+        start[i], end[i] = a * win / SR, b * win / SR
+    return [dict(text=t, start=s, dur=e - s) for t, s, e in zip(script, start, end)]
+
+
 def synth(text, role, rate):
     cfg = ROLES[role]
     key = hashlib.sha1(f"{cfg['voice']}|{rate}|{cfg['pitch']}|{text}".encode()).hexdigest()[:16]
-    mp3, meta = f"{WORK}/cache/{key}.mp3", f"{WORK}/cache/{key}.json"
+    audio, meta = f"{WORK}/cache/{key}.{'wav' if ENGINE == 'google' else 'mp3'}", f"{WORK}/cache/{key}.json"
     if not os.path.exists(meta):
         for attempt in range(4):
             try:
-                words = asyncio.run(_synth(text, cfg["voice"], rate, cfg["pitch"], mp3))
+                if ENGINE == "google":
+                    words = _google_synth(text, cfg["voice"], rate, audio)
+                else:
+                    words = asyncio.run(_synth(text, cfg["voice"], rate, cfg["pitch"], audio))
                 break
-            except Exception as e:  # transient websocket failures
+            except Exception as e:  # transient websocket / HTTP failures
                 print("  retry", attempt, e, file=sys.stderr)
         else:
             raise RuntimeError(f"TTS failed: {text}")
         json.dump(words, open(meta, "w"), ensure_ascii=False)
     words = [w for w in json.load(open(meta)) if letters(w["text"])]
-    return ffmpeg_decode(mp3), words
+    return ffmpeg_decode(audio), words
 
 
 def group_words(chunks, words):
@@ -194,7 +296,8 @@ def rms_db(x, i0, i1, win=int(0.01 * SR)):
 
 def cut_point(x, t0, t1):
     """Quietest 10 ms frame between the end of one word and the start of the next."""
-    i0, i1 = int(t0 * SR), int(t1 * SR)
+    t0, t1 = min(t0, t1) - CUT_SLACK, max(t0, t1) + CUT_SLACK
+    i0, i1 = max(0, int(t0 * SR)), int(t1 * SR)
     if i1 - i0 < int(0.03 * SR):
         return max(i0, i1 - int(0.01 * SR))
     db, win = rms_db(x, i0, i1)
