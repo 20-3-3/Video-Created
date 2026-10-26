@@ -31,6 +31,25 @@ ROLES = {
     "attendant": dict(voice="en-US-EmmaMultilingualNeural", pitch="-10Hz", base_rate=-16, rates=(-20, -12)),
 }
 
+# Playback speed per section of the source video (start, end in seconds, speed); the platform
+# announcement scene (frames 314-542) keeps its original pace. Times in LINES are source times.
+SPEED = float(os.environ.get("SPEEDUP", "1.1"))
+TIMELINE = [(0.0, 314 / 30, SPEED), (314 / 30, 543 / 30, 1.0), (543 / 30, None, SPEED)]
+
+
+def remap(t):
+    """Source-video time -> output time."""
+    out = 0.0
+    for a, b, sp in TIMELINE:
+        if t <= a:
+            break
+        out += (min(t, b if b is not None else t) - a) / sp
+    return out
+
+
+def speed_at(t):
+    return next(sp for a, b, sp in TIMELINE if b is None or t < b)
+
 # (role, window_start, window_end, [(chunk text for TTS, [on-screen onset of each word])])
 LINES = [
     ("narrator", 0.3, 3.4, [
@@ -233,12 +252,18 @@ def stretch(x, scale):
 
 
 def build():
-    total = 80.0
+    total = remap(80.0)
     tracks = {r: np.zeros(int(total * SR), np.float32) for r in ROLES}
     report = []
     for li, (role, w0, w1, chunks) in enumerate(LINES):
+        # speeding a section up by k makes the speaker k times faster too
+        sp = speed_at(w0)
+        to_rate = lambda r: int(round(((1 + r / 100) * sp - 1) * 100))
+        w0, w1 = remap(w0), remap(w1)
+        chunks = [(t, [None if o is None else round(remap(o), 3) for o in ons]) for t, ons in chunks]
+        rates = tuple(to_rate(r) for r in ROLES[role]["rates"])
         text = " ".join(t for t, _ in chunks)
-        rate = ROLES[role]["base_rate"]
+        rate = to_rate(ROLES[role]["base_rate"])
         audio, words = synth(text, role, rate)
         parts = split_line(audio, chunks, words)
         # pick a speaking rate so the line as a whole needs little stretching
@@ -247,7 +272,7 @@ def build():
         slots = sum((chunks[k + 1][1][0] if k + 1 < len(chunks) else w1) - chunks[k][1][0] for k in range(len(chunks)))
         if s is None or s * speech > 0.97 * slots:
             s = min(s or 1.0, 0.92 * slots / speech)
-        new_rate = int(round(np.clip((1 + rate / 100) / s * 100 - 100, *ROLES[role]["rates"])))
+        new_rate = int(round(np.clip((1 + rate / 100) / s * 100 - 100, *rates)))
         print(f"L{li + 1:02d} fit: scale={s:.2f} speech={speech:.2f}s slots={slots:.2f}s rate {rate:+d}% -> {new_rate:+d}%")
         if abs(new_rate - rate) >= 2:
             rate = new_rate
@@ -277,6 +302,7 @@ def build():
     for r, x in tracks.items():
         x.tofile(f"{WORK}/track_{r}.f32")
     json.dump(report, open(f"{WORK}/alignment.json", "w"), ensure_ascii=False, indent=1)
+    json.dump(TIMELINE, open(f"{WORK}/timeline.json", "w"))
 
 
 if __name__ == "__main__":

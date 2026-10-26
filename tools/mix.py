@@ -58,10 +58,32 @@ run(["ffmpeg", "-y", "-v", "error", *sum([["-i", f"{WORK}/lv_{r}.wav"] for r in 
      "-filter_complex", f"amix=inputs={len(FX)}:normalize=0,alimiter=limit=0.89:level=false",
      "-c:a", "pcm_f32le", f"{WORK}/voice.wav"])
 
-dur = float(run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", VIDEO]).stdout)
+src_dur = float(run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", VIDEO]).stdout)
+
+# per-section playback speed of the source (written by voiceover.py); the voice tracks are already on the new timeline
+TIMELINE = [(a, src_dur if b is None else b, sp) for a, b, sp in json.load(open(f"{WORK}/timeline.json"))]
+dur = sum((b - a) / sp for a, b, sp in TIMELINE)
+n = len(TIMELINE)
+FPS = 30
+
+
+def sectioned(kind):
+    """Filtergraph that plays each section of the source video/audio at its own speed and joins them."""
+    if kind == "v":
+        parts = [f"[x{i}]trim=start_frame={round(a * FPS)}:end_frame={round(b * FPS)},setpts=(PTS-STARTPTS)/{sp}[y{i}]"
+                 for i, (a, b, sp) in enumerate(TIMELINE)]
+        return (f"[0:v]split={n}" + "".join(f"[x{i}]" for i in range(n)) + ";" + ";".join(parts) + ";"
+                + "".join(f"[y{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0,fps={FPS}[vout]")
+    parts = [f"[b{i}]atrim=start_sample={round(a * SR)}:end_sample={round(b * SR)},asetpts=PTS-STARTPTS"
+             + (f",atempo={sp}" if sp != 1 else "") + f"[c{i}]" for i, (a, b, sp) in enumerate(TIMELINE)]
+    return ("[0:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"asplit={n}" + "".join(f"[b{i}]" for i in range(n)) + ";" + ";".join(parts) + ";"
+            + "".join(f"[c{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1,volume=-1dB[bg]")
+
+
 graph = (
     "[1:a]aformat=sample_rates=48000:channel_layouts=mono,asplit=2[v][sc];"
-    "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=-1dB[bg];"
+    + sectioned("a") + ";"
     "[bg][sc]sidechaincompress=threshold=0.045:ratio=2:attack=20:release=450:knee=4[duck];"
     "[v]pan=stereo|c0=c0|c1=c0[vs];"
     f"[duck][vs]amix=inputs=2:normalize=0,atrim=0:{dur}[mix]"
@@ -79,9 +101,10 @@ for _ in range(3):
     if abs(got + 14.0) < 0.15:
         break
     gain += -14.0 - got
-run(["ffmpeg", "-y", "-v", "error", "-i", VIDEO, "-i", f"{WORK}/master.wav", "-map", "0:v", "-map", "1:a",
-     "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-metadata:s:a:0", "language=rus",
-     "-movflags", "+faststart", "-t", str(dur), OUT])
+run(["ffmpeg", "-y", "-v", "error", "-i", VIDEO, "-i", f"{WORK}/master.wav", "-filter_complex", sectioned("v"),
+     "-map", "[vout]", "-map", "1:a", "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-maxrate", "3M",
+     "-bufsize", "6M", "-pix_fmt", "yuv420p", "-profile:v", "high", "-c:a", "aac", "-b:a", "192k",
+     "-metadata:s:a:0", "language=rus", "-movflags", "+faststart", "-t", f"{dur:.3f}", OUT])
 m = {"input_i": f"{got:.2f} after {gain:+.2f} dB"}
 
 # voice-only stem, same loudness offset as in the final mix
