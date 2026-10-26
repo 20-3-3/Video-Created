@@ -17,6 +17,7 @@ import re
 import ssl
 import subprocess
 import sys
+import time
 
 import edge_tts
 import edge_tts.communicate as edge_comm
@@ -30,10 +31,11 @@ WORK = None  # output directory, set in __main__
 
 ENGINE = os.environ.get("TTS_ENGINE", "edge")
 ROLES = {
-    "narrator": dict(voice=os.environ.get("NARRATOR_VOICE", "en-US-AndrewMultilingualNeural"),
-                     pitch=os.environ.get("NARRATOR_PITCH", "-6Hz"), base_rate=-14, rates=(-18, -10)),
+    "narrator": dict(voice=os.environ.get("NARRATOR_VOICE", "ru-RU-DmitryNeural"),
+                     pitch=os.environ.get("NARRATOR_PITCH", "-4Hz"), base_rate=-14, rates=(-18, -10)),
     "pa": dict(voice="ru-RU-SvetlanaNeural", pitch="+0Hz", base_rate=-10, rates=(-15, -5)),
-    "attendant": dict(voice="en-US-EmmaMultilingualNeural", pitch="-10Hz", base_rate=-16, rates=(-20, -12)),
+    # edge-tts has a single Russian female voice; the attendant differs from the PA by pitch, pace and mix chain
+    "attendant": dict(voice="ru-RU-SvetlanaNeural", pitch="-10Hz", base_rate=-16, rates=(-20, -12)),
 }
 if ENGINE == "google":
     # Chirp 3 HD takes no pitch; voice colour is left to the role chains in mix.py
@@ -134,6 +136,11 @@ LINES = [
 
 STRETCH_MIN, STRETCH_MAX = 0.92, 1.08  # duration scale limits applied by atempo
 WORD_LAG = 0.06  # decoded audio starts this much after edge-tts word offsets
+# edge-tts refuses many requests for Dmitry (no audio): at times most of them, at times one exact request
+# over and over while the same text with any parameter changed goes through. Retries are many and nudge
+# the pitch inaudibly.
+TTS_ATTEMPTS = 24
+PITCH_NUDGE = (0, -1, 1, -2, 2)
 MIN_GAP = 0.06
 # aligned word times can overlap the pause between chunks, so the quietest point is searched a bit wider
 CUT_SLACK = 0.12 if ENGINE == "google" else 0.0
@@ -256,15 +263,17 @@ def synth(text, role, rate):
     key = hashlib.sha1(f"{cfg['voice']}|{rate}|{cfg['pitch']}|{text}".encode()).hexdigest()[:16]
     audio, meta = f"{WORK}/cache/{key}.{'wav' if ENGINE == 'google' else 'mp3'}", f"{WORK}/cache/{key}.json"
     if not os.path.exists(meta):
-        for attempt in range(4):
+        for attempt in range(TTS_ATTEMPTS):
             try:
                 if ENGINE == "google":
                     words = _google_synth(text, cfg["voice"], rate, audio)
                 else:
-                    words = asyncio.run(_synth(text, cfg["voice"], rate, cfg["pitch"], audio))
+                    pitch = f"{int(cfg['pitch'][:-2]) + PITCH_NUDGE[attempt % len(PITCH_NUDGE)]:+d}Hz"
+                    words = asyncio.run(_synth(text, cfg["voice"], rate, pitch, audio))
                 break
             except Exception as e:  # transient websocket / HTTP failures
                 print("  retry", attempt, e, file=sys.stderr)
+                time.sleep(2)
         else:
             raise RuntimeError(f"TTS failed: {text}")
         json.dump(words, open(meta, "w"), ensure_ascii=False)
