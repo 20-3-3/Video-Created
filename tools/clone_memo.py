@@ -1,11 +1,14 @@
 """Read the passenger memo rules in the narrator's own voice (Chatterbox multilingual, MIT licence).
 
 usage: clone_memo.py TAKE.wav REF_START REF_END OUT_DIR [TAKES]
+       clone_memo.py --spans OUT_DIR   (only add the speech spans to existing takes)
 
 The recorded take has no memo, so the four rules are synthesized zero-shot from a stretch of
 the take (REF_START..REF_END seconds, clean speech). Each rule is generated TAKES times; the take
 is saved as OUT_DIR/memo_<n>_take<t>.wav and listed in OUT_DIR/takes.json with its similarity to
-the reference voice; narrator_take.py picks the closest take that fits the rule's slot.
+the reference voice and its speech span (the rule's words force-aligned in the take: whatever the
+model adds after the speech, a breath or a click, falls outside it); narrator_take.py picks the
+closest take that fits the rule's slot.
 """
 import json
 import os
@@ -16,7 +19,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+from align_take import align
 
 # stress marks (U+0301) as the model's Russian front end expects; without them it misplaces some
 RULES = [
@@ -27,7 +30,19 @@ RULES = [
 ]
 
 
+def add_spans(out_dir, takes):
+    for t in takes:
+        words = align(os.path.join(out_dir, t["file"]), RULES[t["rule"] - 1])
+        t["span"] = [words[0]["start"], words[-1]["end"]]
+    json.dump(takes, open(os.path.join(out_dir, "takes.json"), "w"), indent=1)
+
+
 def main():
+    if sys.argv[1] == "--spans":
+        out_dir = sys.argv[2]
+        add_spans(out_dir, json.load(open(os.path.join(out_dir, "takes.json"))))
+        return
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
     take, ref_start, ref_end, out_dir = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
     n_takes = int(sys.argv[5]) if len(sys.argv) > 5 else 3
     os.makedirs(out_dir, exist_ok=True)
@@ -55,7 +70,7 @@ def main():
             sf.write(os.path.join(out_dir, name), x, model.sr)
             takes.append(dict(rule=i, file=name, similarity=round(sim, 3)))
             print(f"rule {i} take {t}: {len(x) / model.sr:.2f}s similarity {sim:.3f}", flush=True)
-    json.dump(takes, open(os.path.join(out_dir, "takes.json"), "w"), indent=1)
+    add_spans(out_dir, takes)
 
 
 if __name__ == "__main__":

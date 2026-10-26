@@ -126,8 +126,11 @@ def pick_memo_take(memo_dir, rule, slot):
     takes = []
     for t in json.load(open(os.path.join(memo_dir, "takes.json"))):
         if t["rule"] == rule:
+            x = vo.ffmpeg_decode(os.path.join(memo_dir, t["file"]))
+            if "span" in t:  # only the aligned speech: a breath or click the model added after it is dropped
+                x = x[max(0, int((t["span"][0] - 0.1) * SR)):int((t["span"][1] + 0.2) * SR)]
             # stricter gate than for the take: generated takes can end in a faint blip after the speech
-            audio, _ = vo.trim(vo.ffmpeg_decode(os.path.join(memo_dir, t["file"])), thr_db=-45, pad=0.06)
+            audio, _ = vo.trim(x, thr_db=-45, pad=0.06)
             takes.append((t["similarity"], len(audio) / SR, t["file"], audio))
     fits = [t for t in takes if t[1] <= slot - vo.MEMO_PAUSE]
     sim, dur, name, audio = max(fits) if fits else min(takes, key=lambda t: t[1])
