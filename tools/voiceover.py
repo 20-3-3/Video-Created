@@ -2,7 +2,7 @@
 
 Each line is synthesized whole (edge-tts, with word boundaries) so intonation stays natural,
 then cut into chunks at caption-group boundaries. Every chunk starts when its first word
-appears on screen and is gently time-stretched (rubberband) so its words track the captions.
+appears on screen and is gently time-stretched (atempo) so its words track the captions.
 """
 import asyncio
 import hashlib
@@ -26,7 +26,7 @@ os.makedirs(f"{WORK}/chunks", exist_ok=True)
 
 ROLES = {
     "narrator": dict(voice=os.environ.get("NARRATOR_VOICE", "en-US-AndrewMultilingualNeural"),
-                     pitch=os.environ.get("NARRATOR_PITCH", "-8Hz"), base_rate=-14, rates=(-18, -10)),
+                     pitch=os.environ.get("NARRATOR_PITCH", "-6Hz"), base_rate=-14, rates=(-18, -10)),
     "pa": dict(voice="ru-RU-SvetlanaNeural", pitch="+0Hz", base_rate=-10, rates=(-15, -5)),
     "attendant": dict(voice="en-US-EmmaMultilingualNeural", pitch="-10Hz", base_rate=-16, rates=(-20, -12)),
 }
@@ -34,13 +34,27 @@ ROLES = {
 # Playback speed per section of the source video (start, end in seconds, speed); the platform
 # announcement scene (frames 314-542) keeps its original pace. Times in LINES are source times.
 SPEED = float(os.environ.get("SPEEDUP", "1.1"))
-TIMELINE = [(0.0, 314 / 30, SPEED), (314 / 30, 543 / 30, 1.0), (543 / 30, None, SPEED)]
+SECTIONS = [(0.0, 314 / 30, SPEED), (314 / 30, 543 / 30, 1.0), (543 / 30, None, SPEED)]
+
+# The passenger memo is read rule by rule: a rule starts when its highlight starts to sweep
+# (first frame number) and the picture freezes on the finished highlight (second frame number)
+# until the rule has been read.
+MEMO = [
+    ("Первое: не садитесь в вагон без света.", 1427, 1439),
+    ("Второе: если дежурная спросит, какая сегодня станция, — не отвечайте.", 1457, 1469),
+    ("Третье: не поднимайтесь по эскалатору, который едет вниз.", 1487, 1497),
+    ("Четвёртое: поезд приходит один раз.", 1517, 1528),
+]
+MEMO_PRE_HOLD = (1425, 0.3)  # breath after "Четыре правила." before the first rule
+MEMO_NEXT = 52.1  # source time of the narrator line that follows the memo
+MEMO_PAUSE = 0.45  # silence after each rule
+HOLDS = []  # (source time, seconds) freeze frames, sized by plan_memo()
 
 
 def remap(t):
     """Source-video time -> output time."""
-    out = 0.0
-    for a, b, sp in TIMELINE:
+    out = sum(d for h, d in HOLDS if h < t)
+    for a, b, sp in SECTIONS:
         if t <= a:
             break
         out += (min(t, b if b is not None else t) - a) / sp
@@ -48,7 +62,12 @@ def remap(t):
 
 
 def speed_at(t):
-    return next(sp for a, b, sp in TIMELINE if b is None or t < b)
+    return next(sp for a, b, sp in SECTIONS if b is None or t < b)
+
+
+def to_rate(rate, speed):
+    """Speaking rate that keeps a section's speaker in step with that section's playback speed."""
+    return int(round(((1 + rate / 100) * speed - 1) * 100))
 
 # (role, window_start, window_end, [(chunk text for TTS, [on-screen onset of each word])])
 LINES = [
@@ -101,7 +120,7 @@ LINES = [
         ("Кому ты веришь?", [74.0])]),
 ]
 
-STRETCH_MIN, STRETCH_MAX = 0.87, 1.15  # duration scale limits applied by rubberband
+STRETCH_MIN, STRETCH_MAX = 0.92, 1.08  # duration scale limits applied by atempo
 WORD_LAG = 0.06  # decoded audio starts this much after edge-tts word offsets
 MIN_GAP = 0.06
 
@@ -246,26 +265,44 @@ def line_scale(parts):
 
 
 def stretch(x, scale):
-    if abs(scale - 1) < 0.015:
+    # WSOLA (atempo) rather than a phase vocoder: no metallic colouring on speech
+    if abs(scale - 1) < 0.02:
         return x
-    return ffmpeg_filter(x, f"rubberband=tempo={1 / scale:.4f}:window=short:formant=preserved:pitchq=quality")
+    return ffmpeg_filter(x, f"atempo={1 / scale:.4f}")
+
+
+def plan_memo():
+    """Synthesize the memo rules and size the freeze frames so each rule ends before the next begins."""
+    HOLDS[:] = [(MEMO_PRE_HOLD[0] / 30, MEMO_PRE_HOLD[1])]
+    lines = []
+    onsets = [f / 30 + 0.05 for _, f, _ in MEMO] + [MEMO_NEXT]
+    for k, (text, _, hold_f) in enumerate(MEMO):
+        sp = speed_at(onsets[k])
+        audio, _ = synth(text, "narrator", to_rate(ROLES["narrator"]["base_rate"], sp))
+        dur = len(trim(audio)[0]) / SR
+        need = dur + MEMO_PAUSE - (onsets[k + 1] - onsets[k]) / sp
+        HOLDS.append((hold_f / 30, max(0.0, np.ceil(need * 30) / 30)))
+        lines.append(("narrator", onsets[k], onsets[k + 1] - 0.05, [(text, [onsets[k]])], True))
+    return lines
 
 
 def build():
+    lines = sorted(LINES + plan_memo(), key=lambda line: line[1])
     total = remap(80.0)
     tracks = {r: np.zeros(int(total * SR), np.float32) for r in ROLES}
     report = []
-    for li, (role, w0, w1, chunks) in enumerate(LINES):
+    for li, (role, w0, w1, chunks, *fixed) in enumerate(lines):
         # speeding a section up by k makes the speaker k times faster too
         sp = speed_at(w0)
-        to_rate = lambda r: int(round(((1 + r / 100) * sp - 1) * 100))
         w0, w1 = remap(w0), remap(w1)
         chunks = [(t, [None if o is None else round(remap(o), 3) for o in ons]) for t, ons in chunks]
-        rates = tuple(to_rate(r) for r in ROLES[role]["rates"])
+        rates = tuple(to_rate(r, sp) for r in ROLES[role]["rates"])
         text = " ".join(t for t, _ in chunks)
-        rate = to_rate(ROLES[role]["base_rate"])
+        rate = to_rate(ROLES[role]["base_rate"], sp)
         audio, words = synth(text, role, rate)
         parts = split_line(audio, chunks, words)
+        if fixed:  # memo rules: the freeze frames were sized for this exact take
+            rates = (rate, rate)
         # pick a speaking rate so the line as a whole needs little stretching
         s = line_scale(parts)
         speech = sum(len(p["audio"]) for p in parts) / SR
@@ -302,7 +339,7 @@ def build():
     for r, x in tracks.items():
         x.tofile(f"{WORK}/track_{r}.f32")
     json.dump(report, open(f"{WORK}/alignment.json", "w"), ensure_ascii=False, indent=1)
-    json.dump(TIMELINE, open(f"{WORK}/timeline.json", "w"))
+    json.dump(dict(sections=SECTIONS, holds=HOLDS), open(f"{WORK}/timeline.json", "w"))
 
 
 if __name__ == "__main__":
